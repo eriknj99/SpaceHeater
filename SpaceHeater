@@ -1,0 +1,244 @@
+#!/usr/bin/python3
+import threading
+import time
+import random
+import os
+import subprocess
+from subprocess import PIPE, Popen
+import shlex
+from termcolor import colored, cprint
+
+logo = '''
+╔═╗┌─┐┌─┐┌─┐┌─┐  ╦ ╦┌─┐┌─┐┌┬┐┌─┐┬─┐
+╚═╗├─┘├─┤│  ├┤   ╠═╣├┤ ├─┤ │ ├┤ ├┬┘
+╚═╝┴  ┴ ┴└─┘└─┘  ╩ ╩└─┘┴ ┴ ┴ └─┘┴└─
+'''
+
+
+
+
+blendFile = "ProjectorDemo.blend"
+numFrames = 100
+reservedFrames = []
+renderedFrames = []
+devices = ["OPENCL","CUDA","CPU"]
+statuses = []
+colorEnabled = True
+frameDeviceColor = True
+
+startTime = time.time()
+
+# Take a duration in seconds and convert it to a readable format
+def formatTime(duration):
+    if(duration < 60):
+        return str(int(duration)) + "s"
+
+    if(duration < 3600):
+        return time.strftime('%M:%S', time.gmtime(int(duration)))
+
+    return time.strftime('%H:%M:%S', time.gmtime(int(duration)))        
+
+
+# A data class for keeping track of device progress
+class deviceStatus:
+    # If color is enable this will return the brand color corresponding to the device brand  
+    def getColor(self):
+        if(colorEnabled):
+            if(self.device == "CPU"):
+                return "blue"
+            if(self.device == "CUDA" or self.device == "OPTIX"):
+                return "green"
+            if(self.device == "OPENCL"):
+                return "red"
+        else:
+            return "white"
+    def getAverageFrameTime(self):
+        sum = 0
+        for t in self.frameTimes:
+            sum += t
+
+        return sum / len(self.frameTimes)
+
+    def __init__(self,device,frame, tilePart, tileWhole, samplePart, sampleWhole):
+        self.device = device
+        self.frame = frame
+        self.tilePart = tilePart
+        self.tileWhole = tileWhole
+        self.samplePart = samplePart
+        self.sampleWhole = sampleWhole
+        self.color = self.getColor()
+        
+        self.startTime = 0 
+        self.completedFrames = []
+        self.frameTimes = []
+
+    
+
+def updateDisplay():
+
+    block = "█"
+    partialBlock = "░"
+    barLength = 25
+    
+    # Clear the screen
+    os.system('cls' if os.name == 'nt' else 'clear')
+    
+    out = logo + "\n"
+    
+    out += f"Rendering {colored(blendFile, attrs=['underline'])}\n\n"
+    out += f"Total Time: {formatTime(int(time.time() - startTime))}\n"
+
+    # Print out remaining time estimate
+    # TODO : Make this more accurate
+    if(len(renderedFrames) > 2):
+        avgTimePerFrame = (time.time() - startTime) / len(renderedFrames)
+        timeRemaining = (numFrames - len(renderedFrames)) * avgTimePerFrame
+        out += f"Remaining: ~{formatTime(timeRemaining)}\n\n"
+
+    out+= f"Completed Frames: {len(renderedFrames)}/{numFrames}\n"
+    out += "["
+    
+    # Generate the main progress bar
+    for frame in range(numFrames):
+       if(frame not in reservedFrames):
+            out+= " "
+
+       for status in statuses:
+            if(frame in status.completedFrames):
+                if(frameDeviceColor and colorEnabled):
+                    out+= colored(block, status.color)
+                else:
+                    out+= block
+                break
+            
+            if(status.frame == frame):
+                if(frameDeviceColor):
+                    out+= colored(partialBlock, status.color)
+                else:
+                    out+= partialBlock
+                break
+
+    out += "]\n"
+    
+    # Generate the device progress bars 
+    for status in statuses:
+        # Draw the separator
+        out += ((barLength+2)*"━") + "\n"
+        
+        # Draw the device heading
+        out += f"{colored(status.device,status.color,attrs=['bold'])}\nFrame: {status.frame}\n"
+        
+        # Draw the time statistics
+        out += f"Time: {formatTime(time.time() - status.startTime)}\n"
+        if(len(status.frameTimes) > 0):
+            out += f"Remaining: ~{formatTime(status.getAverageFrameTime() - (time.time() - status.startTime))}\n" 
+        
+        if(status.tileWhole != 0): # Prevent devide by 0 on program start
+            # Generate the tile progress bar
+            out += f"Tile: {status.tilePart}/{status.tileWhole}\n["
+            numBlocks = int(barLength * (status.tilePart/status.tileWhole))
+            out += colored(numBlocks * block, status.color)
+            out += (barLength - numBlocks) * " "
+            out += "]\n"
+        
+        if(status.sampleWhole != 0): # Prevent devide by 0 on program start
+            # Generate the sample progress bar
+            out += f"Sample: {status.samplePart}/{status.sampleWhole}\n["
+            numBlocks = int(barLength * (status.samplePart/status.sampleWhole))
+            out += colored(numBlocks * block, status.color)
+            out += (barLength - numBlocks) * " "
+            out += "]\n"
+    
+    # Draw the separator
+    out += ((barLength+2)*"━") + "\n"
+
+    print(out)
+
+# Parse the output from the blender command
+def parseOutput(device, line):
+    if("Rendered" in line):
+        # Parse Rendered Tiles
+        tileRatio = (line[line.index("Rendered") + len("Rendered"):line.index("Tiles")])
+        tilePart = int(tileRatio[:tileRatio.index("/")])
+        tileWhole = int(tileRatio[tileRatio.index("/") + 1:])
+        
+        # Parse Frame
+        frame = int(line[line.index("Fra:") + len("Fra:"): line.index("Mem")])
+
+        # Parse samples
+        samplePart = 0 # Set default values in case they arn't displayed
+        sampleWhole = 0
+        if("Sample" in line):
+            sampleSubStr = line[line.index("Sample"):]
+            sampleRatio = ( sampleSubStr[len("Sample"):sampleSubStr.index(",")])
+            samplePart = int(sampleRatio[:sampleRatio.index("/")])
+            sampleWhole = int(sampleRatio[sampleRatio.index("/") + 1:])
+
+        # Update render status
+        for status in statuses:
+            if(status.device == device):
+                status.frame = frame
+                status.tilePart = tilePart
+                status.tileWhole = tileWhole
+                status.samplePart = samplePart
+                if(sampleWhole != 0):
+                    status.sampleWhole = sampleWhole
+        
+        #        #print(line, end="\r")
+
+
+def render(device):
+    global reservedFrames
+    # Loop until all frames are rendered or in progress
+    while(len(reservedFrames) != numFrames):
+        # Get the next available frame and reserve it 
+        nextFrame = -1
+        for i in range(numFrames):
+            if(i not in reservedFrames):
+                nextFrame = i
+                break 
+        reservedFrames.append(nextFrame)
+        
+        # Update the frame start time
+        for status in statuses:
+            if(status.device == device):
+                status.startTime = time.time()
+
+        # Generate the blender command
+        cmd = f"/sbin/blender -b {blendFile} -f {nextFrame} -- --cycles-device {device}"
+        
+        # Execute the blender command
+        p = Popen(cmd, stderr=subprocess.DEVNULL, stdout=PIPE, shell=True)
+        
+        # Capture and parse the stdout
+        while(p.poll() == None):
+            line = str(p.stdout.readline())
+            if("Rendered" in line):
+                parseOutput(device,line) 
+       
+        # Wait for process to end just in case
+        p.wait()
+
+        # Mark the frame as completed
+        renderedFrames.append(nextFrame)
+        
+
+        # Update the frame startTime and completedFrames
+        for status in statuses:
+            if(status.device == device):
+                status.frameTimes.append(time.time() - status.startTime)
+                status.completedFrames.append(nextFrame)
+    
+
+    print(f"Device {device} is done rendering")
+    return
+
+for device in devices:
+    statuses.append(deviceStatus(device, 0,0,0,0,0))
+    t = threading.Thread(target=render, args=(device,))
+    t.start()
+
+# Update the display every second
+while(True):
+    updateDisplay()
+    time.sleep(1)
