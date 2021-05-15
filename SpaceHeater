@@ -15,7 +15,6 @@ logo = '''
 ╚═╝┴  ┴ ┴└─┘└─┘  ╩ ╩└─┘┴ ┴ ┴ └─┘┴└─
 '''
 
-
 helpText = logo + '''
     
     ---Help---
@@ -52,6 +51,8 @@ statuses = []
 colorEnabled = True
 frameDeviceColor = True
 
+completedTime = 0
+
 startTime = time.time()
 
 # Take a duration in seconds and convert it to a readable format
@@ -84,6 +85,9 @@ class deviceStatus:
             sum += t
 
         return sum / len(self.frameTimes)
+    
+    def getTimeRemaining(self):
+        return (self.getAverageFrameTime() - (time.time() - self.startTime))
 
     def __init__(self,device,frame, tilePart, tileWhole, samplePart, sampleWhole):
         self.device = device
@@ -100,24 +104,63 @@ class deviceStatus:
 
         self.done = False    
 
+def isRenderCompleted():
+    for status in statuses:
+        if(not status.done):
+            return False
+    return True
+
+# This does not work. I need to figure out how to calculate the time for a parellel process 
+def getTimeRemaining():
+    # Get the total time to render all current frames
+    totalRenderTime = 0
+    for status in statuses:
+        for time in status.frameTimes:
+            totalRenderTime += time
+
+    # Calculate time remaining of not reserved frames
+    averageTimePerFrame = totalRenderTime / len(renderedFrames)
+    remainingFrames = numFrames - len(renderedFrames)
+    timeRemaining = remainingFrames * averageTimePerFrame
+
+    return formatTime(timeRemaining)
+
+
+# Generate the display text and print it 
 def updateDisplay():
+    global completedTime
+    global renderCompleted
 
     block = "█"
     partialBlock = "░"
     barLength = 25
-    
+   
+    # Add the logo
     out = logo + "\n"
-    
-    out += f"Rendering {colored(blendFile, attrs=['underline'])}\n"
-    out += f"Frames {startFrame}-{endFrame}\n\n"
-    out += f"Total Time: {formatTime(int(time.time() - startTime))}\n"
 
-    # Print out remaining time estimate
-    # TODO : Make this more accurate
-    if(len(renderedFrames) > 2):
-        avgTimePerFrame = (time.time() - startTime) / len(renderedFrames)
-        timeRemaining = (numFrames - len(renderedFrames)) * avgTimePerFrame
-        out += f"Remaining: ~{formatTime(timeRemaining)}\n"
+    # Check is render is completed
+    renderCompleted = isRenderCompleted()
+    if(renderCompleted):
+        # If this is the first completed loop set the completedTime
+        if(completedTime == 0):
+            completedTime = time.time() - startTime
+
+    # Display different information based on the render status
+    if(not renderCompleted):
+        # Render information
+        out += f"Rendering {colored(blendFile, attrs=['underline'])}\n"
+        out += f"Frames {startFrame}-{endFrame-1}\n\n"
+        out += f"Total Time: {formatTime(int(time.time() - startTime))}\n"
+    else:
+        out += "Done\n"
+        out += f"Rendered {colored(blendFile, attrs=['underline'])}\n"
+        out += f"Frames {startFrame}-{endFrame-1}\n\n"
+        out += f"Total Time: {formatTime(completedTime)}\n"
+ 
+
+    # Display remaining time estimate if enough frames are completed 
+    if(len(renderedFrames) > 2 and not renderCompleted):
+        out += f"Remaining: INACCURATE! WILL FIX ~{getTimeRemaining()}\n"
 
     out+= f"\nCompleted Frames: {len(renderedFrames)}/{numFrames}\n"
     out += "["
@@ -144,25 +187,30 @@ def updateDisplay():
 
     out += "]\n\n"
     
-    # Generate the device progress bars 
+    # Generate the device information 
     for status in statuses:
         # Draw the separator
         out += ((barLength+2)*"━") + "\n"
         
         # Draw the device heading
         out += f"{colored(status.device,status.color,attrs=['bold'])}"
-        # Check if the device is done.
+        
+        # Display different information if the device is done.
         if(status.done):
             out += (" : Done\n")
+            out += f"Rendered: {len(status.completedFrames)} frames\n"
         else:
-            out += f"\nFrame: {status.frame}\n"
+            out += f"\nRendering Frame: {status.frame}\n\n"
 
             # Draw the time statistics
             out += f"Time: {formatTime(time.time() - status.startTime)}\n"
             if(len(status.frameTimes) > 0):
-                out += f"Remaining: ~{formatTime(status.getAverageFrameTime() - (time.time() - status.startTime))}\n" 
-            
-            if(status.tileWhole != 0): # Prevent devide by 0 on program start
+                out += f"Average: {formatTime(status.getAverageFrameTime())}\n"
+                out += f"Remaining: ~{formatTime(status.getTimeRemaining())}\n" 
+            out += "\n" 
+
+            # Generate device progress bars if data is available
+            if(status.tileWhole != 0): 
                 # Generate the tile progress bar
                 out += f"Tile: {status.tilePart}/{status.tileWhole}\n["
                 numBlocks = int(barLength * (status.tilePart/status.tileWhole))
@@ -170,7 +218,7 @@ def updateDisplay():
                 out += (barLength - numBlocks) * " "
                 out += "]\n"
             
-            if(status.sampleWhole != 0): # Prevent devide by 0 on program start
+            if(status.sampleWhole != 0):
                 # Generate the sample progress bar
                 out += f"Sample: {status.samplePart}/{status.sampleWhole}\n["
                 numBlocks = int(barLength * (status.samplePart/status.sampleWhole))
@@ -279,18 +327,32 @@ def argParse():
     global blendFile
     global startFrame
     global endFrame
+    specifiedFile = False
+    specifiedStart = False
+    specifiedEnd = False
+    specifiedDevice = False
     for i in range(len(sys.argv)):
         if(sys.argv[i] == "--blendFile" and i+1 < len(sys.argv)):
             blendFile = sys.argv[i+1]
+            specifiedFile = True
         if(sys.argv[i] == "--device" and i+1 < len(sys.argv)):
             devices.append(sys.argv[i+1])
+            specifiedDevice = True
         if(sys.argv[i] == "--color" and i+1 < len(sys.argv)):
             color = (argv[i] == "true")
         if(sys.argv[i] == "--startFrame" and i+1 < len(sys.argv)):
             startFrame = int(sys.argv[i+1])
+            specifiedStart = True
         if(sys.argv[i] == "--endFrame" and i+1 < len(sys.argv)):
             endFrame = int(sys.argv[i+1])
+            specifiedEnd = True
         if(sys.argv[i] == "--help" or sys.argv[i] == "help" or sys.argv[i] == "h"):
+            print(helpText)
+            exit(0)
+
+    # Check if all required args were specified
+    if(not (specifiedFile and specifiedDevice and specifiedStart and specifiedEnd)):
+            print("You must specify all required arguments!")
             print(helpText)
             exit(0)
 
